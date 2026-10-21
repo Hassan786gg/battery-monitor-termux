@@ -31,6 +31,14 @@ battery-monitor
 
 The dashboard refreshes every two seconds. Press `Ctrl+C` to stop.
 
+### Responsive terminal layout
+
+The dashboard uses a rounded frame, a charge gauge, and aligned telemetry rows. It recalculates its layout on each refresh, so rotating the phone or resizing Termux does not require a restart.
+
+On short screens, charge and charging state take priority over secondary readings. The frame stays closed, and a footer reports hidden rows and suggests resizing. Extremely small terminals use a borderless summary. Long telemetry values are clipped with `…` instead of wrapping and pushing the bottom of the frame off-screen; wide characters and combining marks are measured in terminal cells. One column and one row are reserved to avoid terminal autowrap and scrolling.
+
+Increase the terminal height (or reduce Termux's font size) to see more readings. Output redirected to a file keeps all telemetry rows rather than applying the interactive height limit. `NO_COLOR=1` disables color without disabling the responsive layout.
+
 ## Update
 
 ```sh
@@ -96,6 +104,16 @@ The app average resets when charging status or power source changes, after an AP
 If the battery API times out, check that the Termux:API Android companion app is installed from the same source as Termux. Follow any Android permission prompts. Installing only `pkg install termux-api` is not enough: the Android companion app is also required.
 
 Missing or invalid numeric readings show `n/a`, not a health diagnosis. The dashboard includes `Developer: Hassan Raza` and adapts its lines to the terminal width.
+
+## Development tests
+
+```sh
+python3 -m unittest discover -v
+python3 -m py_compile live_battery_monitor.py
+bash -n install.sh
+```
+
+The tests include narrow/short terminal sizes, Unicode cell widths, API errors, color output, resize transitions, redirected logs, and the existing telemetry and update regressions. No Android device or root access is needed to run them; actual phone telemetry still requires Termux and its API companion app.
 
 ## Uninstall
 

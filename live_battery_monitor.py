@@ -16,6 +16,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import unicodedata
 from datetime import datetime
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -248,41 +249,71 @@ def value_or(value, formatter=str, nonnegative=False):
         return "n/a"
 
 
-def display(data, error=None):
-    """Build one frame, then repaint once to reduce flicker and stale rows."""
-    terminal = shutil.get_terminal_size((78, 24))
-    columns = max(8, terminal.columns)
-    indent = "  " if columns >= 20 else ""
-    # Leave one column spare so terminal autowrap does not add blank lines.
-    width = min(72, columns - len(indent) - 1)
-    inner = max(1, width - 4)
-    lines = []
+def cell_width(text):
+    """Terminal cells, not Python characters (no extra Termux dependency)."""
+    return sum(1 if char == "\ufe0f" else
+               0 if unicodedata.combining(char) or unicodedata.category(char) in ("Cf", "Mn", "Me")
+               else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+               for char in text)
 
-    def border(top=False, bottom=False):
-        left, right = ("┌", "┐") if top else (("└", "┘") if bottom else ("├", "┤"))
-        lines.append(indent + left + "─" * (inner + 2) + right)
 
-    def row(text="", color=None):
-        parts = textwrap.wrap(clean_text(text), width=inner) or [""]
-        for part in parts:
-            lines.append(indent + "│ " + paint(part.ljust(inner), color) + " │")
+def fit_text(text, width, pad=False):
+    """Sanitize and fit a single line without splitting wide characters."""
+    text = "".join(char for char in clean_text(text)
+                   if unicodedata.category(char) != "Cf")
+    width = max(0, width)
+    if cell_width(text) > width:
+        used, clipped = 0, []
+        for char in text:
+            cells = cell_width(char)
+            if used + cells > max(0, width - 1):
+                break
+            clipped.append(char)
+            used += cells
+        text = "".join(clipped) + ("…" if width else "")
+    return text + (" " * (width - cell_width(text)) if pad else "")
 
-    def footer(text):
-        for part in textwrap.wrap(clean_text(text), width=max(1, columns - len(indent) - 1)):
-            lines.append(indent + paint(part, "dim"))
 
-    border(top=True)
-    row("BATTERY / LIVE MONITOR", "bold")
-    row("Developer: Hassan Raza", "dim")
-    border()
-    row("Updated " + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"), "dim")
+def render_frame(data, error=None, columns=78, rows=None):
+    """Return a complete frame; rows=None keeps all readings for redirected logs.
 
-    if error or not isinstance(data, dict):
-        row()
-        row("Could not read battery data", "yellow")
-        row(error or "Unexpected battery API response.")
-        border(bottom=True)
-        footer(f"Retrying in {POLL_SECONDS}s · Ctrl+C to quit")
+    Choose rows by importance before drawing, never slice a finished frame.
+    Leave the last terminal column and row unused to prevent autowrap/scroll.
+    """
+    available = max(0, columns - 1)
+    budget = None if rows is None else max(0, rows - 1)
+    if not available or budget == 0:
+        return ""
+    indent = "  " if columns >= 40 else ""
+    width = min(74, available - len(indent))
+    framed = width >= 16 and (budget is None or budget >= 5)
+    inner = width - 4 if framed else available
+    entries = []
+
+    def row(text="", color=None, priority=5):
+        entries.append((text, color, priority))
+
+    def metric(label, value, color=None, priority=3):
+        # Keep values readable on phones instead of wrapping padded labels.
+        if inner < 44:
+            label = {"SYSTEM HEALTH FLAG": "HEALTH FLAG", "BATTERY POWER (EST)": "BATT W (EST)",
+                     "TEMPERATURE": "TEMP", "CURRENT (RAW)": "RAW CURRENT",
+                     "DEVICE INPUT W": "USB INPUT W", "DEVICE OUTPUT W": "USB OUTPUT W",
+                     "CHARGE COUNTER": "COUNTER"}.get(label, label)
+        label_width = min(20, max(5, inner // 2))
+        value = fit_text(value, max(1, inner - label_width - 1))
+        row(fit_text(label, label_width, pad=True) + " " + value, color, priority)
+
+    row(f"BATTERY / LIVE MONITOR  v{VERSION}", "bold", 1 if inner >= 16 else 8)
+    updated = datetime.now().astimezone().strftime("%H:%M:%S %Z")
+    row("Developer: Hassan Raza · Updated " + updated, "dim", 8)
+    failed = bool(error) or not isinstance(data, dict)
+    if failed:
+        row("Could not read battery data", "yellow", 0)
+        # Error prose can wrap, but is still subject to the frame's height budget.
+        message = clean_text(error or "Unexpected battery API response.")
+        for part in textwrap.wrap(message, width=max(1, inner))[:8]:
+            row(part, None, 2)
     else:
         pct = finite_number(data.get("percentage"))
         if pct is None:
@@ -290,73 +321,101 @@ def display(data, error=None):
             if level is not None and scale is not None and scale > 0:
                 pct = finite_number(level / scale * 100)
         if pct is None or pct < 0:
-            percent_text, gauge, charge_color = "n/a", "░" * 12, "dim"
+            percent_text, charge_color, pct = "n/a", "dim", None
         else:
             pct = min(100, pct)
-            filled = round(pct / 100 * 12)
-            gauge = "█" * filled + "░" * (12 - filled)
             percent_text = f"{pct:.0f}%"
             charge_color = "green" if pct >= 60 else ("yellow" if pct >= 25 else "red")
+        gauge_size = min(24, max(0, inner - 16))
+        filled = round(pct / 100 * gauge_size) if pct is not None else 0
+        gauge = "━" * filled + "─" * (gauge_size - filled)
+        charge = f"CHARGE  {percent_text:>4}  {gauge}".rstrip()
+        if inner < 16:
+            charge = percent_text + (" CHARGE" if inner >= 10 else "")
+        row(charge, charge_color, 0)
         status = clean_text(data.get("status") or "n/a").replace("_", " ")
         plugged = clean_text(data.get("plugged") or "n/a").replace("_", " ")
         health = clean_text(data.get("health") or "n/a").replace("_", " ")
         health_color = "green" if health == "GOOD" else ("yellow" if health == "n/a" else "red")
-        row()
-        row(f"CHARGE   {percent_text:>4}   {gauge}", charge_color)
-        row(f"STATE    {status} · {plugged}", "cyan")
-        power = battery_power_watts(data)
-        row("BATTERY POWER (EST)  " + value_or(power, lambda x: f"{abs(x):.2f} W"), "cyan")
-        row("Battery-side magnitude; not charger input.", "dim")
-        row("DEVICE MAX W         n/a (not exposed)")
-        io_data = data.get("_power_io") or {}
-        for direction in ("input", "output"):
-            reading = io_data.get(direction)
-            if reading is not None:
-                row(f"DEVICE {direction.upper()} W".ljust(21) + value_or(reading.get("watts"), lambda x: f"{x:.2f} W"), "cyan")
-                volts = value_or(reading.get("voltage_v"), lambda x: f"{x:.3f} V")
-                amps = value_or(reading.get("current_a"), lambda x: f"{x:.3f} A")
-                row(f"{reading['supply']}/{reading['port']}: {volts} · {amps} · {reading['method']}", "dim")
-            else:
-                row(f"DEVICE {direction.upper()} W".ljust(21) + "n/a (not measured)")
-        if not io_data.get("input") and not io_data.get("output"):
-            for reading in io_data.get("ports", [])[:2]:
-                if reading.get("watts") is not None:
-                    row(f"PORT {reading['supply']}: {reading['watts']:.2f} W (direction unknown)")
-        for reading in io_data.get("ports", [])[:2]:
-            if reading.get("limit_watts") is not None:
-                row(f"{reading['supply']} LIMIT: {reading['limit_watts']:.2f} W (not live draw)", "dim")
-        if not io_data.get("input") and not io_data.get("output"):
-            row("I/O unavailable? Run: battery-monitor diagnose", "dim")
-        border()
-        row(f"SYSTEM HEALTH FLAG   {health}", health_color)
-        row("TEMPERATURE          " + value_or(data.get("temperature"), lambda x: f"{x:.1f} °C"))
-        row("VOLTAGE              " + value_or(data.get("voltage"), lambda x: f"{x / 1000:.3f} V", True))
+        row(f"STATE    {status} · {plugged}", "cyan", 2)
+        metric("SYSTEM HEALTH FLAG", health, health_color, 3)
+        metric("TEMPERATURE", value_or(data.get("temperature"), lambda x: f"{x:.1f} °C"), priority=3)
         current = current_number(data.get("current"))
+        if current is not None and current < 0 and status.strip().upper() == "CHARGING":
+            row("Charging reported; raw current sign is negative.", "yellow", 3)
+        metric("BATTERY POWER (EST)", value_or(battery_power_watts(data), lambda x: f"{abs(x):.2f} W"), "cyan", 4)
+        row("Battery-side magnitude; not charger input.", "dim", 4)
+        metric("CURRENT (RAW)", value_or(current, lambda x: f"{x / 1000:.0f} mA"), priority=4)
         average = current_number(data.get("current_average"))
-        row("CURRENT (RAW)        " + value_or(current, lambda x: f"{x / 1000:.0f} mA"))
         if average is not None:
-            row("AVG (PHONE/RAW)      " + value_or(average, lambda x: f"{x / 1000:.0f} mA"))
+            metric("AVG (PHONE/RAW)", value_or(average, lambda x: f"{x / 1000:.0f} mA"), priority=5)
         else:
             average = current_number(data.get("_app_current_average"))
             count = data.get("_app_current_samples", 0)
-            row(f"AVG (APP/RAW, {count})".ljust(21) + value_or(average, lambda x: f"{x / 1000:.0f} mA"))
-        if current is not None and current < 0 and status.strip().upper() == "CHARGING":
-            row("Charging reported; raw current sign is negative.", "yellow")
-        row("CHARGE COUNTER       " + value_or(data.get("charge_counter"), lambda x: f"{x / 1000:.0f} mAh", True))
-        row("CYCLE COUNT          " + value_or(data.get("cycle"), lambda x: f"{x:.0f}", True))
-        border(bottom=True)
-        footer("Raw sign is phone-reported. App average: last 30s; count shown.")
-        footer("Live telemetry only · Android does not expose a standard battery-wear %")
-        footer(f"Refreshes every {POLL_SECONDS}s · Ctrl+C to quit")
-    if TTY and len(lines) > max(1, terminal.lines - 1):
-        # Do not scroll the whole screen on every refresh in a short window.
-        budget = max(1, terminal.lines - 1)
-        notice = "Resize for more readings · Ctrl+C to quit"
-        lines = lines[:max(0, budget - 1)]
-        lines.append(indent + notice[:max(1, columns - len(indent) - 1)])
-    frame = "\n".join(lines)
+            metric(f"AVG (APP/RAW, {count})", value_or(average, lambda x: f"{x / 1000:.0f} mA"), priority=5)
+        metric("VOLTAGE", value_or(data.get("voltage"), lambda x: f"{x / 1000:.3f} V", True), priority=5)
+        io_data = data.get("_power_io") or {}
+        for direction in ("input", "output"):
+            reading = io_data.get(direction)
+            metric(f"DEVICE {direction.upper()} W", value_or(reading.get("watts"), lambda x: f"{x:.2f} W")
+                   if reading is not None else "n/a (not measured)", "cyan", 5)
+            if reading is not None:
+                volts = value_or(reading.get("voltage_v"), lambda x: f"{x:.3f} V")
+                amps = value_or(reading.get("current_a"), lambda x: f"{x:.3f} A")
+                row(f"{reading['supply']}/{reading['port']}: {volts} · {amps} · {reading['method']}", "dim", 6)
+        if not io_data.get("input") and not io_data.get("output"):
+            for reading in io_data.get("ports", [])[:2]:
+                if reading.get("watts") is not None:
+                    row(f"PORT {reading['supply']}: {reading['watts']:.2f} W (direction unknown)", None, 6)
+            row("I/O unavailable? Run: battery-monitor diagnose", "dim", 7)
+        for reading in io_data.get("ports", [])[:2]:
+            if reading.get("limit_watts") is not None:
+                row(f"{reading['supply']} LIMIT: {reading['limit_watts']:.2f} W (not live draw)", "dim", 6)
+        metric("DEVICE MAX W", "n/a (not exposed)", priority=6)
+        metric("CHARGE COUNTER", value_or(data.get("charge_counter"), lambda x: f"{x / 1000:.0f} mAh", True), priority=6)
+        metric("CYCLE COUNT", value_or(data.get("cycle"), lambda x: f"{x:.0f}", True), priority=6)
+        row("Raw sign is phone-reported. App average: last 30s; count shown.", "dim", 7)
+        row("Live telemetry only · No standard battery-wear %", "dim", 7)
+
+    footer = f"{'Retry' if failed else 'Live'} {POLL_SECONDS}s · Ctrl+C to quit"
+    # Two border lines and one footer are reserved before choosing content.
+    capacity = len(entries) if budget is None else max(0, budget - (3 if framed else 1))
+    hidden = max(0, len(entries) - capacity)
+    selected = set(sorted(range(len(entries)), key=lambda i: (entries[i][2], i))[:capacity])
+    chosen = [entry for i, entry in enumerate(entries) if i in selected]
+    if hidden:
+        footer = f"+{hidden} hidden · Resize · Ctrl+C quit"
+        if failed:
+            footer = f"Retry {POLL_SECONDS}s · " + footer
+        if width < 32:
+            footer = "Ctrl+C quit · Resize for more"
+        if width < 12:
+            footer = "Ctrl+C"
+    if budget == 1:
+        # A single usable row must contain the result, not just a title/footer.
+        entry = min(entries, key=lambda entry: entry[2])
+        return paint(fit_text(entry[0], available), entry[1])
+    if framed:
+        lines = [indent + "╭" + "─" * (inner + 2) + "╮"]
+        for text, color, _ in chosen:
+            lines.append(indent + "│ " + paint(fit_text(text, inner, pad=True), color) + " │")
+        lines.append(indent + "╰" + "─" * (inner + 2) + "╯")
+        lines.append(indent + paint(fit_text(footer, width), "dim"))
+    else:
+        lines = [paint(fit_text(text, available), color) for text, color, _ in chosen]
+        lines.append(paint(fit_text(footer, available), "dim"))
+    return "\n".join(lines)
+
+
+def display(data, error=None):
+    """Recompute layout on every refresh, including after a terminal resize."""
+    terminal = shutil.get_terminal_size((78, 24))
+    frame = render_frame(data, error, terminal.columns, terminal.lines if TTY else None)
     if TTY:
-        print("\033[H" + frame + "\033[J", end="", flush=True)
+        # Erase each row's old tail as well as old rows below the new frame.
+        # Clearing only at frame end leaves stale right edges after resizing.
+        frame = "\033[K\n".join(frame.split("\n"))
+        print("\033[H" + frame + "\033[K\033[J", end="", flush=True)
     else:
         print(frame, flush=True)
 
