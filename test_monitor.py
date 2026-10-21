@@ -216,6 +216,50 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(enriched["_app_current_average"], 5000)
         self.assertEqual(enriched["_app_current_samples"], 1)
 
+    def test_battery_power_watts_uses_signed_battery_side_millivolt_microamp_input(self):
+        negative = monitor.battery_power_watts({"voltage": 4224, "current": -2472000})
+        positive = monitor.battery_power_watts({"voltage": "4224", "current": "2472000"})
+        self.assertAlmostEqual(negative, -10.441728, places=9)
+        self.assertAlmostEqual(positive, 10.441728, places=9)
+        self.assertEqual(monitor.battery_power_watts({"voltage": 4224, "current": 0}), 0.0)
+
+    def test_battery_power_watts_rejects_bad_voltage_and_current_safely(self):
+        bad_voltages = (None, True, False, float("nan"), float("inf"), -1, 0, 2147483648)
+        for voltage in bad_voltages:
+            with self.subTest(voltage=voltage):
+                self.assertIsNone(monitor.battery_power_watts({"voltage": voltage, "current": 1000}))
+        bad_currents = (None, True, False, float("nan"), float("inf"), -2147483648, 2147483648, "bad")
+        for current in bad_currents:
+            with self.subTest(current=current):
+                self.assertIsNone(monitor.battery_power_watts({"voltage": 4224, "current": current}))
+        for value in (None, [], "not a mapping"):
+            with self.subTest(value=value):
+                self.assertIsNone(monitor.battery_power_watts(value))
+        self.assertIsNone(monitor.battery_power_watts({"current": 1000}))
+
+    def test_display_shows_positive_battery_magnitude_and_never_charger_power_claims(self):
+        for status in ("CHARGING", "FULL", "UNPLUGGED"):
+            with self.subTest(status=status):
+                frame = self.capture_display({
+                    "voltage": 4224, "current": -2472000, "status": status,
+                    "plugged": "AC" if status == "CHARGING" else "NONE",
+                })
+                self.assertIn("BATTERY POWER (EST)", frame)
+                self.assertIn("10.44 W", frame)
+                self.assertIn("Battery-side magnitude; not charger input.", frame)
+                self.assertIn("DEVICE MAX W         n/a (not exposed)", frame)
+                self.assertIn("CHARGER INPUT W      n/a (not exposed)", frame)
+                self.assertNotIn("charger input 10.44", frame.lower())
+                self.assertNotIn("max rating", frame.lower())
+
+    def test_display_marks_invalid_power_as_na_and_keeps_power_rows_within_width(self):
+        readable = self.capture_display({"voltage": 0, "current": -2472000}, columns=80)
+        self.assertIn("BATTERY POWER (EST)  n/a", readable)
+        for columns in (8, 20, 32, 40, 80):
+            with self.subTest(columns=columns):
+                frame = self.capture_display({"voltage": 0, "current": -2472000}, columns=columns)
+                self.assertTrue(all(len(line) <= columns - 1 for line in frame.splitlines()), frame)
+
     def test_main_resets_history_when_battery_api_returns_error(self):
         fake_history = mock.Mock()
         fake_history.with_average.side_effect = AssertionError("must not enrich API errors")

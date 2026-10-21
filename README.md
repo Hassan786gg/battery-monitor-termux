@@ -45,9 +45,23 @@ Use `battery-monitor --version` to check the installed version, or `battery-moni
 
 ## What it shows
 
-Charge percentage, charging state, Android's system health flag, temperature, voltage, current, charge-counter and cycle-count fields when the phone reports them. Some fields are unavailable on some devices.
+Charge percentage, charging state, Android's system health flag, temperature, voltage, current, estimated battery-side power in watts, charge-counter and cycle-count fields when the phone reports them. Some fields are unavailable on some devices.
 
 Android's standard battery API does not provide a dependable battery-wear or remaining-capacity percentage. The `GOOD` health flag is the system-reported status, not a precise measure of battery degradation.
+
+## Power in watts
+
+`BATTERY POWER (EST)` shows the **magnitude of net battery-side power**, calculated from the phone's instantaneous battery voltage and current:
+
+```text
+watts = |voltage_mV × current_microamps| / 1,000,000,000
+```
+
+For the reported example, **4.224 V × 2.472 A = 10.44 W** of estimated battery-side power magnitude. This works while charging or discharging, preserves the signed current in its own row, and does not infer power-flow direction from charging status. If voltage or current is unavailable or invalid, power shows `n/a`. A valid zero-current reading gives `0.00 W`.
+
+**This is not the charger's delivered power, wall-socket consumption, total phone power use, or the phone's maximum supported charging wattage.** Charger input also supplies the phone's running load and conversion losses; battery voltage is not USB/charger voltage. Therefore the dashboard displays `DEVICE MAX W` and `CHARGER INPUT W` as `n/a (not exposed)` rather than making up those values. The [standard Termux battery-status implementation](https://github.com/termux/termux-api/blob/master/app/src/main/java/com/termux/api/apis/BatteryStatusAPI.java) does not expose those measurements.
+
+Check the manufacturer's specifications for the phone's supported maximum charging wattage. Measuring actual charger input requires suitable device telemetry or an external USB power meter. A supported maximum is a rating, not the power the phone draws continuously.
 
 ## Current and average current
 

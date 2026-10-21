@@ -19,7 +19,7 @@ from datetime import datetime
 from urllib.error import URLError
 from urllib.request import urlopen
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 POLL_SECONDS = 2
 AVERAGE_WINDOW_SECONDS = 30
 COMMAND = "termux-battery-status"
@@ -62,6 +62,17 @@ def current_number(value):
     if number is None or not (-2147483648 < number <= 2147483647):
         return None
     return number
+
+
+def battery_power_watts(data):
+    """Signed battery-side estimate: mV * microamps / 1e9, not charger input."""
+    if not isinstance(data, dict):
+        return None
+    voltage = finite_number(data.get("voltage"))
+    current = current_number(data.get("current"))
+    if voltage is None or not (0 < voltage <= 2147483647) or current is None:
+        return None
+    return finite_number((voltage / 1000) * (current / 1000000))
 
 
 class CurrentHistory:
@@ -198,6 +209,11 @@ def display(data, error=None):
         row()
         row(f"CHARGE   {percent_text:>4}   {gauge}", charge_color)
         row(f"STATE    {status} · {plugged}", "cyan")
+        power = battery_power_watts(data)
+        row("BATTERY POWER (EST)  " + value_or(power, lambda x: f"{abs(x):.2f} W"), "cyan")
+        row("Battery-side magnitude; not charger input.", "dim")
+        row("DEVICE MAX W         n/a (not exposed)")
+        row("CHARGER INPUT W      n/a (not exposed)")
         border()
         row(f"SYSTEM HEALTH FLAG   {health}", health_color)
         row("TEMPERATURE          " + value_or(data.get("temperature"), lambda x: f"{x:.1f} °C"))
