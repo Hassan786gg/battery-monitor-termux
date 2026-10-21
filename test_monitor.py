@@ -121,6 +121,112 @@ class MonitorTests(unittest.TestCase):
             monitor.main(["--not-a-real-option"])
         self.assertEqual(raised.exception.code, 2)
 
+    def test_current_number_preserves_negative_microamps_and_rejects_sentinels(self):
+        self.assertEqual(monitor.current_number(-2472000), -2472000)
+        self.assertEqual(monitor.current_number("-2472000"), -2472000)
+        for value in (None, "", "bad", float("nan"), float("inf"), -2147483648, 2147483648):
+            with self.subTest(value=value):
+                self.assertIsNone(monitor.current_number(value))
+
+    def test_history_app_average_fallback_for_missing_or_invalid_phone_average(self):
+        history = monitor.CurrentHistory()
+        enriched = history.with_average({"current": 2000, "current_average": "not-a-number"}, now=1)
+        self.assertEqual(enriched["_app_current_average"], 2000)
+        self.assertEqual(enriched["_app_current_samples"], 1)
+        frame = self.capture_display(enriched)
+        self.assertIn("AVG (APP/RAW, 1)", frame)
+        self.assertIn("2 mA", frame)
+
+        enriched = history.with_average({"current": 3000}, now=2)
+        self.assertEqual(enriched["_app_current_average"], 2500)
+        frame = self.capture_display(dict(enriched, current_average=float("nan")))
+        self.assertIn("AVG (APP/RAW, 2)", frame)
+
+    def test_display_prefers_valid_phone_average_including_zero(self):
+        frame = self.capture_display({
+            "current": -2472000, "current_average": 0,
+            "_app_current_average": 9000, "_app_current_samples": 3,
+            "status": "CHARGING",
+        })
+        self.assertIn("CURRENT (RAW)        -2472 mA", frame)
+        self.assertIn("AVG (PHONE/RAW)      0 mA", frame)
+        self.assertNotIn("AVG (APP/RAW", frame)
+
+    def test_missing_instantaneous_current_clears_history_instead_of_using_stale_average(self):
+        history = monitor.CurrentHistory()
+        history.with_average({"current": 7000}, now=10)
+        enriched = history.with_average({"current": None}, now=12)
+        self.assertIsNone(enriched["_app_current_average"])
+        self.assertEqual(enriched["_app_current_samples"], 0)
+        self.assertEqual(len(history.samples), 0)
+
+    def test_history_uses_signed_sample_mean_and_does_not_mutate_input(self):
+        history = monitor.CurrentHistory()
+        original = {"current": -2472000, "status": "charging", "nested": {"keep": True}}
+        snapshot = dict(original)
+        history.with_average(original, now=0)
+        enriched = history.with_average({"current": -1000, "status": "charging"}, now=1)
+        self.assertEqual(enriched["_app_current_average"], -1236500)
+        self.assertEqual(original, snapshot)
+        self.assertNotIn("_app_current_average", original)
+        self.assertNotIn("_app_current_samples", original)
+
+    def test_history_expires_samples_after_thirty_seconds_even_with_gaps(self):
+        history = monitor.CurrentHistory()
+        history.with_average({"current": 1000}, now=0)
+        history.with_average({"current": 3000}, now=10)
+        enriched = history.with_average({"current": 5000}, now=40)
+        self.assertEqual(enriched["_app_current_samples"], 2)
+        self.assertEqual(enriched["_app_current_average"], 4000)
+        enriched = history.with_average({"current": 7000}, now=71)
+        self.assertEqual(enriched["_app_current_samples"], 1)
+        self.assertEqual(enriched["_app_current_average"], 7000)
+
+    def test_history_queue_is_bounded_to_128_samples(self):
+        history = monitor.CurrentHistory()
+        for value in range(200):
+            history.with_average({"current": value}, now=100)
+        self.assertEqual(len(history.samples), 128)
+        self.assertEqual(history.samples[0], (100, 72))
+        self.assertEqual(history.samples[-1], (100, 199))
+
+    def test_history_state_and_plugged_transitions_reset_samples(self):
+        history = monitor.CurrentHistory()
+        history.with_average({"current": 1000, "status": "charging", "plugged": "ac"}, now=1)
+        history.with_average({"current": 3000, "status": "charging", "plugged": "ac"}, now=2)
+        enriched = history.with_average({"current": 9000, "status": "discharging", "plugged": "ac"}, now=3)
+        self.assertEqual(enriched["_app_current_average"], 9000)
+        self.assertEqual(enriched["_app_current_samples"], 1)
+        enriched = history.with_average({"current": 11000, "status": "discharging", "plugged": "usb"}, now=4)
+        self.assertEqual(enriched["_app_current_average"], 11000)
+        self.assertEqual(enriched["_app_current_samples"], 1)
+
+    def test_history_rejects_nonfinite_and_sentinel_current_values(self):
+        history = monitor.CurrentHistory()
+        for value in (float("nan"), float("inf"), -2147483648, 2147483648, "oops"):
+            with self.subTest(value=value):
+                enriched = history.with_average({"current": value}, now=1)
+                self.assertIsNone(enriched["_app_current_average"])
+                self.assertEqual(enriched["_app_current_samples"], 0)
+
+    def test_history_backward_time_resets_before_accepting_new_sample(self):
+        history = monitor.CurrentHistory()
+        history.with_average({"current": 1000}, now=10)
+        enriched = history.with_average({"current": 5000}, now=9)
+        self.assertEqual(enriched["_app_current_average"], 5000)
+        self.assertEqual(enriched["_app_current_samples"], 1)
+
+    def test_main_resets_history_when_battery_api_returns_error(self):
+        fake_history = mock.Mock()
+        fake_history.with_average.side_effect = AssertionError("must not enrich API errors")
+        fake_history.reset.side_effect = KeyboardInterrupt
+        with mock.patch.object(monitor, "CurrentHistory", return_value=fake_history), \
+             mock.patch.object(monitor, "TTY", False), \
+             mock.patch.object(monitor, "read_battery_status", return_value=(None, "API failed")), \
+             mock.patch.object(monitor, "display"):
+            self.assertEqual(monitor.main([]), 0)
+        fake_history.reset.assert_called_once_with()
+
     def update_with_payload(self, directory, payload, target_content="old", **patches):
         prefix = Path(directory)
         destination = prefix / "bin" / "battery-monitor"

@@ -49,11 +49,19 @@ Charge percentage, charging state, Android's system health flag, temperature, vo
 
 Android's standard battery API does not provide a dependable battery-wear or remaining-capacity percentage. The `GOOD` health flag is the system-reported status, not a precise measure of battery degradation.
 
+## Current and average current
+
+`CURRENT (RAW)` preserves the signed reading supplied by the phone. Seeing `CHARGING` and `-2472 mA` together does not mean the dashboard calculated the sign incorrectly: charging status and current are separate phone-reported values. Android documents positive current as entering the battery and negative current as leaving it, but a sign/status mismatch alone does not establish its cause. The dashboard flags the mismatch rather than silently flipping the sign. See the [Android current-property reference](https://developer.android.com/reference/android/os/BatteryManager#BATTERY_PROPERTY_CURRENT_NOW).
+
+`AVG (PHONE/RAW)` uses the phone's average-current reading when available, with its device-defined averaging period. If that reading is missing or invalid, `AVG (APP/RAW, N)` shows an **app-calculated sample mean** of valid raw current readings from the last **30 seconds**; `N` is the sample count. It starts with the first valid sample, so the first estimate is not yet a full 30-second average. It is not a hardware measurement or charger-output rating.
+
+The app average resets when charging status or power source changes, after an API error, or when instantaneous current becomes unavailable. It does not reuse samples older than 30 seconds. If neither a native average nor usable current samples exist, the average remains `n/a`. Zero is a valid reported reading and is not treated as missing.
+
 ## Troubleshooting
 
 If the battery API times out, check that the Termux:API Android companion app is installed from the same source as Termux. Follow any Android permission prompts. Installing only `pkg install termux-api` is not enough: the Android companion app is also required.
 
-Negative current can indicate discharge; its sign depends on the phone. Missing or invalid numeric readings show `n/a`, not a health diagnosis. The dashboard includes `Developer: Hassan Raza` and adapts its lines to the terminal width.
+Missing or invalid numeric readings show `n/a`, not a health diagnosis. The dashboard includes `Developer: Hassan Raza` and adapts its lines to the terminal width.
 
 ## Uninstall
 

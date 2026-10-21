@@ -3,6 +3,7 @@
 
 import argparse
 import ast
+from collections import deque
 import json
 import math
 import os
@@ -18,8 +19,9 @@ from datetime import datetime
 from urllib.error import URLError
 from urllib.request import urlopen
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 POLL_SECONDS = 2
+AVERAGE_WINDOW_SECONDS = 30
 COMMAND = "termux-battery-status"
 SOURCE_URL = "https://raw.githubusercontent.com/Hassan786gg/battery-monitor-termux/main/live_battery_monitor.py"
 MAX_DOWNLOAD = 1024 * 1024
@@ -52,6 +54,52 @@ def finite_number(value):
         return number if math.isfinite(number) else None
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def current_number(value):
+    """BatteryManager current is a signed int in microamps; reject sentinels."""
+    number = finite_number(value)
+    if number is None or not (-2147483648 < number <= 2147483647):
+        return None
+    return number
+
+
+class CurrentHistory:
+    """Sample mean of valid raw current readings in the last 30 seconds."""
+
+    def __init__(self):
+        self.samples = deque(maxlen=128)
+        self.state = None
+
+    def reset(self):
+        self.samples.clear()
+        self.state = None
+
+    def with_average(self, data, now=None):
+        if not isinstance(data, dict):
+            self.reset()
+            return data
+        now = time.monotonic() if now is None else now
+        state = tuple(clean_text(data.get(key) or "").strip().upper()
+                      for key in ("status", "plugged"))
+        if state != self.state or (self.samples and now < self.samples[-1][0]):
+            self.reset()
+        self.state = state
+        while self.samples and now - self.samples[0][0] > AVERAGE_WINDOW_SECONDS:
+            self.samples.popleft()
+        current = current_number(data.get("current"))
+        if current is None:
+            # Never present an old estimate as a fresh reading after API failure.
+            self.samples.clear()
+        else:
+            self.samples.append((now, current))
+        enriched = dict(data)
+        count = len(self.samples)
+        enriched["_app_current_average"] = (
+            math.fsum(value / count for _, value in self.samples) if count else None
+        )
+        enriched["_app_current_samples"] = count
+        return enriched
 
 
 def read_battery_status():
@@ -154,11 +202,21 @@ def display(data, error=None):
         row(f"SYSTEM HEALTH FLAG   {health}", health_color)
         row("TEMPERATURE          " + value_or(data.get("temperature"), lambda x: f"{x:.1f} °C"))
         row("VOLTAGE              " + value_or(data.get("voltage"), lambda x: f"{x / 1000:.3f} V", True))
-        row("CURRENT              " + value_or(data.get("current"), lambda x: f"{x / 1000:.0f} mA"))
-        row("AVERAGE CURRENT      " + value_or(data.get("current_average"), lambda x: f"{x / 1000:.0f} mA"))
+        current = current_number(data.get("current"))
+        average = current_number(data.get("current_average"))
+        row("CURRENT (RAW)        " + value_or(current, lambda x: f"{x / 1000:.0f} mA"))
+        if average is not None:
+            row("AVG (PHONE/RAW)      " + value_or(average, lambda x: f"{x / 1000:.0f} mA"))
+        else:
+            average = current_number(data.get("_app_current_average"))
+            count = data.get("_app_current_samples", 0)
+            row(f"AVG (APP/RAW, {count})".ljust(21) + value_or(average, lambda x: f"{x / 1000:.0f} mA"))
+        if current is not None and current < 0 and status.strip().upper() == "CHARGING":
+            row("Charging reported; raw current sign is negative.", "yellow")
         row("CHARGE COUNTER       " + value_or(data.get("charge_counter"), lambda x: f"{x / 1000:.0f} mAh", True))
         row("CYCLE COUNT          " + value_or(data.get("cycle"), lambda x: f"{x:.0f}", True))
         border(bottom=True)
+        footer("Raw sign is phone-reported. App average: last 30s; count shown.")
         footer("Live telemetry only · Android does not expose a standard battery-wear %")
         footer(f"Refreshes every {POLL_SECONDS}s · Ctrl+C to quit")
     if TTY and len(lines) > max(1, terminal.lines - 1):
@@ -230,11 +288,16 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "update":
         return update()
+    history = CurrentHistory()
     try:
         if TTY:
             print("\033[2J\033[H\033[?25l", end="", flush=True)
         while True:
             data, error = read_battery_status()
+            if error:
+                history.reset()
+            else:
+                data = history.with_average(data)
             display(data, error)
             time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:
