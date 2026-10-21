@@ -6,19 +6,20 @@ if ! command -v pkg >/dev/null 2>&1 || [ -z "${PREFIX:-}" ]; then
     exit 1
 fi
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-SCRIPT_SOURCE="$SCRIPT_DIR/live_battery_monitor.py"
-
-if [ ! -f "$SCRIPT_SOURCE" ]; then
-    echo "Could not find live_battery_monitor.py beside this installer."
-    exit 1
-fi
-
-pkg install -y python termux-api
+pkg install -y python termux-api curl </dev/null
 mkdir -p "$PREFIX/bin"
-cp "$SCRIPT_SOURCE" "$PREFIX/bin/battery-monitor"
-chmod 755 "$PREFIX/bin/battery-monitor"
+DOWNLOAD="$(mktemp "$PREFIX/bin/.battery-monitor.XXXXXX")"
+trap 'rm -f "$DOWNLOAD"' EXIT
+curl -fsSL --retry 3 \
+    https://raw.githubusercontent.com/Hassan786gg/battery-monitor-termux/main/live_battery_monitor.py \
+    -o "$DOWNLOAD"
+# Validate the download before replacing a working installation.
+python -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$DOWNLOAD"
+chmod 755 "$DOWNLOAD"
+mv -f "$DOWNLOAD" "$PREFIX/bin/battery-monitor"
+trap - EXIT
 
 echo
-echo "Installed. Run: battery-monitor"
+echo "Installed. Next time, run: battery-monitor"
 echo "Make sure the Termux:API Android app is installed from the same source as Termux."
+exec "$PREFIX/bin/battery-monitor"
