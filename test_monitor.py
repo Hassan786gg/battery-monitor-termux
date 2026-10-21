@@ -43,6 +43,32 @@ class MonitorTests(unittest.TestCase):
             monitor.display(data, error)
         return out.getvalue().rstrip("\n")
 
+    def power_fixture(self):
+        temp = tempfile.TemporaryDirectory()
+        root = Path(temp.name)
+        supply, typec = root / "power_supply", root / "typec"
+        supply.mkdir()
+        typec.mkdir()
+        return temp, supply, typec
+
+    @staticmethod
+    def write_node(root, name, **files):
+        node = root / name
+        node.mkdir(parents=True, exist_ok=True)
+        for filename, value in files.items():
+            (node / filename).write_text(str(value), encoding="utf-8")
+        return node
+
+    def connected_port(self, typec, name="port0", role="[sink] source"):
+        self.write_node(typec, name, power_role=role)
+        (typec / (name + "-partner")).mkdir()
+
+    def assert_measurement_shape(self, measurement):
+        self.assertTrue({
+            "supply", "voltage_v", "current_a", "watts", "method",
+            "limit_watts", "kind",
+        }.issubset(measurement))
+
     def test_finite_number_rejects_bool_nan_inf_and_bad_values(self):
         for value in (True, False, float("nan"), float("inf"), float("-inf"), None, "wat"):
             with self.subTest(value=value):
@@ -248,7 +274,9 @@ class MonitorTests(unittest.TestCase):
                 self.assertIn("10.44 W", frame)
                 self.assertIn("Battery-side magnitude; not charger input.", frame)
                 self.assertIn("DEVICE MAX W         n/a (not exposed)", frame)
-                self.assertIn("CHARGER INPUT W      n/a (not exposed)", frame)
+                self.assertIn("DEVICE INPUT W", frame)
+                self.assertIn("DEVICE OUTPUT W", frame)
+                self.assertIn("n/a (not measured)", frame)
                 self.assertNotIn("charger input 10.44", frame.lower())
                 self.assertNotIn("max rating", frame.lower())
 
@@ -259,6 +287,131 @@ class MonitorTests(unittest.TestCase):
             with self.subTest(columns=columns):
                 frame = self.capture_display({"voltage": 0, "current": -2472000}, columns=columns)
                 self.assertTrue(all(len(line) <= columns - 1 for line in frame.splitlines()), frame)
+
+    def test_read_power_io_direct_power_now_maps_sink_to_input(self):
+        temp, supply, typec = self.power_fixture()
+        with temp:
+            self.write_node(supply, "usb0", type="USB", online=1,
+                            voltage_now=5000000, current_now=900000,
+                            power_now=4200000, input_power_limit=15000000)
+            self.connected_port(typec, role="source [sink]")
+            before = sorted(str(path.relative_to(Path(temp.name))) for path in Path(temp.name).rglob("*"))
+            result = monitor.read_power_io(supply, typec)
+            after = sorted(str(path.relative_to(Path(temp.name))) for path in Path(temp.name).rglob("*"))
+        self.assertEqual(before, after)
+        self.assertIsNone(result["output"])
+        self.assertEqual(result["roles"], [{"port": "port0", "role": "sink"}])
+        self.assertEqual(len(result["ports"]), 1)
+        measurement = result["input"]
+        self.assert_measurement_shape(measurement)
+        self.assertEqual(measurement["supply"], "usb0")
+        self.assertEqual(measurement["kind"], "USB")
+        self.assertEqual(measurement["method"], "power_now")
+        self.assertAlmostEqual(measurement["watts"], 4.2)
+        self.assertAlmostEqual(measurement["limit_watts"], 15.0)
+
+    def test_read_power_io_estimates_voltage_times_current_and_source_is_output(self):
+        temp, supply, typec = self.power_fixture()
+        with temp:
+            self.write_node(supply, "USB-C", type="USB_PD", online=2,
+                            voltage_now=9000000, current_now=1500000,
+                            input_power_limit=18000000)
+            self.connected_port(typec, role="sink [source]")
+            result = monitor.read_power_io(supply, typec)
+        self.assertIsNone(result["input"])
+        measurement = result["output"]
+        self.assert_measurement_shape(measurement)
+        self.assertEqual(measurement["method"], "V*I estimate")
+        self.assertAlmostEqual(measurement["voltage_v"], 9.0)
+        self.assertAlmostEqual(measurement["current_a"], 1.5)
+        self.assertAlmostEqual(measurement["watts"], 13.5)
+        self.assertEqual(measurement["port"], "port0")
+
+    def test_read_power_io_excludes_offline_battery_and_unrecognized_supply(self):
+        temp, supply, typec = self.power_fixture()
+        with temp:
+            self.write_node(supply, "USB-off", type="USB", online=0, power_now=9999999)
+            self.write_node(supply, "BAT0", type="Battery", online=1, power_now=9999999)
+            self.write_node(supply, "AC", type="Mains", online=1, power_now=2000000)
+            self.write_node(supply, "weird", type="Battery", online=1, power_now=3000000)
+            self.connected_port(typec)
+            result = monitor.read_power_io(supply, typec)
+        self.assertEqual([item["supply"] for item in result["ports"]], ["AC"])
+        self.assertIsNone(result["input"])
+        self.assertIsNone(result["output"])
+
+    def test_read_power_io_unknown_or_ambiguous_role_preserves_measurement_without_assignment(self):
+        for role in ("", "sink source", "[sink] [source]"):
+            with self.subTest(role=role):
+                temp, supply, typec = self.power_fixture()
+                with temp:
+                    self.write_node(supply, "usb", type="USB", online=1, power_now=0)
+                    self.connected_port(typec, role=role)
+                    result = monitor.read_power_io(supply, typec)
+                self.assertEqual(len(result["ports"]), 1)
+                self.assertEqual(result["ports"][0]["watts"], 0.0)
+                self.assertIsNone(result["input"])
+                self.assertIsNone(result["output"])
+
+    def test_read_power_io_multiple_supplies_or_ports_are_ambiguous_but_preserved(self):
+        temp, supply, typec = self.power_fixture()
+        with temp:
+            for name in ("usb0", "usb1"):
+                self.write_node(supply, name, type="USB", online=1, power_now=1000000)
+            self.connected_port(typec, "port0", "[sink]")
+            self.connected_port(typec, "port1", "[source]")
+            result = monitor.read_power_io(supply, typec)
+        self.assertEqual({item["supply"] for item in result["ports"]}, {"usb0", "usb1"})
+        self.assertEqual(result["roles"], [{"port": "port0", "role": "sink"}, {"port": "port1", "role": "source"}])
+        self.assertIsNone(result["input"])
+        self.assertIsNone(result["output"])
+
+    def test_read_power_io_limits_are_not_live_power_and_invalid_values_are_safe(self):
+        temp, supply, typec = self.power_fixture()
+        with temp:
+            self.write_node(supply, "usb", type="USB", online=1,
+                            voltage_now="bad", current_now=-1,
+                            input_power_limit=12000000)
+            self.connected_port(typec, role="[sink]")
+            result = monitor.read_power_io(supply, typec)
+        self.assertEqual(result["ports"][0]["limit_watts"], 12.0)
+        self.assertIsNone(result["ports"][0]["watts"])
+        self.assertIsNone(result["input"])
+        self.assertNotIn("limit_watts", result.get("input") or {})
+
+    def test_read_power_io_zero_voltage_current_and_missing_roots_are_safe(self):
+        temp, supply, typec = self.power_fixture()
+        with temp:
+            self.write_node(supply, "usb", type="USB", online=1,
+                            voltage_now=5000000, current_now=0)
+            self.connected_port(typec, role="[sink]")
+            result = monitor.read_power_io(supply, typec)
+        self.assertEqual(result["input"]["watts"], 0.0)
+        self.assertEqual(result["input"]["method"], "V*I estimate")
+        missing = monitor.read_power_io(Path(temp.name) / "missing", Path(temp.name) / "none")
+        self.assertEqual(missing["ports"], [])
+        self.assertEqual(missing["roles"], [])
+        self.assertIsNone(missing["input"])
+        self.assertTrue(missing["reason"])
+
+    def test_read_power_io_bounds_supply_scan_and_reports_reason(self):
+        temp, supply, typec = self.power_fixture()
+        with temp:
+            for index in range(33):
+                self.write_node(supply, f"USB{index:02d}", type="USB", online=1, power_now=1000000)
+            result = monitor.read_power_io(supply, typec)
+        self.assertLessEqual(len(result["ports"]), 32)
+        self.assertIn("Too many", result["reason"])
+
+    def test_diagnose_prints_json_without_calling_battery_api(self):
+        with mock.patch.object(monitor, "read_battery_status", side_effect=AssertionError("battery API called")), \
+             mock.patch.object(monitor, "read_power_io", return_value={"input": None, "output": None, "ports": [], "roles": [], "reason": "test"}):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(monitor.main(["diagnose"]), 0)
+        parsed = json.loads(output.getvalue())
+        self.assertEqual(parsed["reason"], "test")
+        self.assertEqual(set(parsed), {"input", "output", "ports", "roles", "reason"})
 
     def test_main_resets_history_when_battery_api_returns_error(self):
         fake_history = mock.Mock()

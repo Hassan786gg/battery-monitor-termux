@@ -4,6 +4,7 @@
 import argparse
 import ast
 from collections import deque
+from itertools import islice
 import json
 import math
 import os
@@ -19,10 +20,12 @@ from datetime import datetime
 from urllib.error import URLError
 from urllib.request import urlopen
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 POLL_SECONDS = 2
 AVERAGE_WINDOW_SECONDS = 30
 COMMAND = "termux-battery-status"
+POWER_SUPPLY_ROOT = Path("/sys/class/power_supply")
+TYPEC_ROOT = Path("/sys/class/typec")
 SOURCE_URL = "https://raw.githubusercontent.com/Hassan786gg/battery-monitor-termux/main/live_battery_monitor.py"
 MAX_DOWNLOAD = 1024 * 1024
 TTY = sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
@@ -73,6 +76,98 @@ def battery_power_watts(data):
     if voltage is None or not (0 < voltage <= 2147483647) or current is None:
         return None
     return finite_number((voltage / 1000) * (current / 1000000))
+
+
+def read_power_io(supply_root=None, typec_root=None):
+    """Best-effort kernel measurements. Never writes sysfs or requests root."""
+    supply_root = Path(supply_root) if supply_root is not None else POWER_SUPPLY_ROOT
+    typec_root = Path(typec_root) if typec_root is not None else TYPEC_ROOT
+    result = {"input": None, "output": None, "ports": [], "roles": [], "reason": ""}
+    denied = False
+    truncated = False
+
+    def text(path):
+        nonlocal denied
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                return handle.read(256).strip()
+        except PermissionError:
+            denied = True
+        except (OSError, UnicodeError):
+            pass
+        return ""
+
+    def nodes(root):
+        nonlocal denied, truncated
+        try:
+            found = list(islice(root.iterdir(), 33))
+            truncated = truncated or len(found) > 32
+            return sorted(found[:32])
+        except PermissionError:
+            denied = True
+        except OSError:
+            pass
+        return []
+
+    def micro(path, positive=False):
+        raw = finite_number(text(path))
+        if raw is None or not (0 <= raw <= 1e12) or (positive and raw == 0):
+            return None
+        return raw / 1000000
+
+    for node in nodes(supply_root):
+        kind = text(node / "type").upper()
+        if not (kind.startswith("USB") or kind in ("MAINS", "WIRELESS")):
+            continue
+        if finite_number(text(node / "online")) not in (1, 2):
+            continue
+        volts = micro(node / "voltage_now", positive=True)
+        amps = micro(node / "current_now")
+        watts = micro(node / "power_now")
+        method = "power_now" if watts is not None else None
+        if watts is None and volts is not None and amps is not None:
+            watts = finite_number(volts * amps)
+            method = "V*I estimate" if watts is not None else None
+        result["ports"].append({
+            "supply": clean_text(node.name), "kind": kind,
+            "voltage_v": volts, "current_a": amps, "watts": watts,
+            "method": method, "limit_watts": micro(node / "input_power_limit"),
+        })
+
+    active_ports = 0
+    for node in nodes(typec_root):
+        if not re.fullmatch(r"port\d+", node.name):
+            continue
+        try:
+            if not (typec_root / (node.name + "-partner")).is_dir():
+                continue
+        except OSError:
+            continue
+        active_ports += 1
+        raw = text(node / "power_role").lower()
+        selected = re.findall(r"\[(sink|source)\]", raw)
+        role = selected[0] if len(selected) == 1 else (raw if raw in ("sink", "source") else None)
+        if role:
+            result["roles"].append({"port": node.name, "role": role})
+
+    usb = [port for port in result["ports"] if port["kind"].startswith("USB")]
+    # Do not combine several supply aliases, guess a connector mapping, use a
+    # configured limit as live draw, or infer USB direction from battery status.
+    if (not truncated and len(usb) == 1 and len(result["ports"]) == 1
+            and active_ports == 1 and len(result["roles"]) == 1
+            and usb[0]["watts"] is not None):
+        direction = "input" if result["roles"][0]["role"] == "sink" else "output"
+        result[direction] = dict(usb[0], port=result["roles"][0]["port"])
+        result["reason"] = "USB power role and supply mapping identified; opposite flow is not measured."
+    elif denied:
+        result["reason"] = "Android denied access to some power telemetry; no permission changes attempted."
+    elif truncated:
+        result["reason"] = "Too many telemetry nodes for an unambiguous bounded probe."
+    elif result["ports"]:
+        result["reason"] = "Live values or an unambiguous connected USB source/sink mapping are unavailable."
+    else:
+        result["reason"] = "No readable online external power telemetry; unsupported, restricted, or disconnected."
+    return result
 
 
 class CurrentHistory:
@@ -213,7 +308,25 @@ def display(data, error=None):
         row("BATTERY POWER (EST)  " + value_or(power, lambda x: f"{abs(x):.2f} W"), "cyan")
         row("Battery-side magnitude; not charger input.", "dim")
         row("DEVICE MAX W         n/a (not exposed)")
-        row("CHARGER INPUT W      n/a (not exposed)")
+        io_data = data.get("_power_io") or {}
+        for direction in ("input", "output"):
+            reading = io_data.get(direction)
+            if reading is not None:
+                row(f"DEVICE {direction.upper()} W".ljust(21) + value_or(reading.get("watts"), lambda x: f"{x:.2f} W"), "cyan")
+                volts = value_or(reading.get("voltage_v"), lambda x: f"{x:.3f} V")
+                amps = value_or(reading.get("current_a"), lambda x: f"{x:.3f} A")
+                row(f"{reading['supply']}/{reading['port']}: {volts} · {amps} · {reading['method']}", "dim")
+            else:
+                row(f"DEVICE {direction.upper()} W".ljust(21) + "n/a (not measured)")
+        if not io_data.get("input") and not io_data.get("output"):
+            for reading in io_data.get("ports", [])[:2]:
+                if reading.get("watts") is not None:
+                    row(f"PORT {reading['supply']}: {reading['watts']:.2f} W (direction unknown)")
+        for reading in io_data.get("ports", [])[:2]:
+            if reading.get("limit_watts") is not None:
+                row(f"{reading['supply']} LIMIT: {reading['limit_watts']:.2f} W (not live draw)", "dim")
+        if not io_data.get("input") and not io_data.get("output"):
+            row("I/O unavailable? Run: battery-monitor diagnose", "dim")
         border()
         row(f"SYSTEM HEALTH FLAG   {health}", health_color)
         row("TEMPERATURE          " + value_or(data.get("temperature"), lambda x: f"{x:.1f} °C"))
@@ -300,10 +413,13 @@ def update():
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Live Android battery monitor for Termux.")
     parser.add_argument("--version", action="version", version=f"battery-monitor {VERSION}")
-    parser.add_argument("command", nargs="?", choices=["update"], help="Install the latest version and exit")
+    parser.add_argument("command", nargs="?", choices=["update", "diagnose"], help="Update, or print read-only I/O diagnostics")
     args = parser.parse_args(argv)
     if args.command == "update":
         return update()
+    if args.command == "diagnose":
+        print(json.dumps(read_power_io(), indent=2, ensure_ascii=True))
+        return 0
     history = CurrentHistory()
     try:
         if TTY:
@@ -314,6 +430,8 @@ def main(argv=None):
                 history.reset()
             else:
                 data = history.with_average(data)
+                if isinstance(data, dict):
+                    data["_power_io"] = read_power_io()
             display(data, error)
             time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:

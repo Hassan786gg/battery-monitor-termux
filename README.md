@@ -59,9 +59,29 @@ watts = |voltage_mV × current_microamps| / 1,000,000,000
 
 For the reported example, **4.224 V × 2.472 A = 10.44 W** of estimated battery-side power magnitude. This works while charging or discharging, preserves the signed current in its own row, and does not infer power-flow direction from charging status. If voltage or current is unavailable or invalid, power shows `n/a`. A valid zero-current reading gives `0.00 W`.
 
-**This is not the charger's delivered power, wall-socket consumption, total phone power use, or the phone's maximum supported charging wattage.** Charger input also supplies the phone's running load and conversion losses; battery voltage is not USB/charger voltage. Therefore the dashboard displays `DEVICE MAX W` and `CHARGER INPUT W` as `n/a (not exposed)` rather than making up those values. The [standard Termux battery-status implementation](https://github.com/termux/termux-api/blob/master/app/src/main/java/com/termux/api/apis/BatteryStatusAPI.java) does not expose those measurements.
+**This is not the charger's delivered power, wall-socket consumption, total phone power use, or the phone's maximum supported charging wattage.** Charger input also supplies the phone's running load and conversion losses; battery voltage is not USB/charger voltage. `DEVICE MAX W` remains `n/a (not exposed)` rather than being guessed. The [standard Termux battery-status implementation](https://github.com/termux/termux-api/blob/master/app/src/main/java/com/termux/api/apis/BatteryStatusAPI.java) does not expose charger-input measurements; optional read-only kernel telemetry is used separately below.
 
 Check the manufacturer's specifications for the phone's supported maximum charging wattage. Measuring actual charger input requires suitable device telemetry or an external USB power meter. A supported maximum is a rating, not the power the phone draws continuously.
+
+## Device input and output
+
+Version 1.3.0 adds an automatic, **read-only** probe of `/sys/class/power_supply` and `/sys/class/typec`. It never requests root, writes kernel settings, changes charging limits, or swaps USB roles. Android may restrict access, and some drivers do not expose the measurements at all, so this feature cannot work on every phone.
+
+- `DEVICE INPUT W` means electrical power entering the phone through an identified USB sink port.
+- `DEVICE OUTPUT W` means power supplied by the phone through an identified USB source port, such as USB OTG or reverse-wired charging. **It is not the phone's internal power consumption.**
+- Input/output values use the driver's live `power_now`, or a clearly labelled `V*I estimate` from `voltage_now` and `current_now` on the **same supply**. Voltage, current and the telemetry source are shown alongside the result. The kernel fields use micro-units, unlike Termux's millivolt battery-voltage field.
+
+To avoid attaching a reading to the wrong port, automatic classification requires exactly one online external supply of USB type, exactly one connected Type-C partner, and a readable unambiguous current `sink` or `source` role. Multiple supplies/ports, missing roles, older connectors, negative or invalid port measurements, disconnected devices, or permission restrictions leave input/output as `n/a (not measured)`. This is not a zero-power reading. If a supply measurement is readable but direction cannot be established, it appears separately as `PORT ... (direction unknown)` rather than being guessed as input or output. Supplies are never summed, since some are aliases for the same physical path.
+
+A readable `input_power_limit` is shown as `LIMIT ... (not live draw)`. Limits, maximum voltage/current settings, battery power, and USB role alone are never substituted for measured input/output watts. The unmeasured opposite direction also remains `n/a`, not an invented zero. Sources: [Linux power-supply units and properties](https://docs.kernel.org/power/power_supply_class.html), [power-supply ABI](https://github.com/torvalds/linux/blob/master/Documentation/ABI/testing/sysfs-class-power), and [USB Type-C role ABI](https://github.com/torvalds/linux/blob/master/Documentation/ABI/testing/sysfs-class-typec).
+
+If input/output stays unavailable, stop the dashboard and run:
+
+```sh
+battery-monitor diagnose
+```
+
+This prints local read-only diagnostics: accessible supply measurements, current USB roles, and an availability explanation. It does not upload anything or read serial numbers. Share that output when requesting device-specific support. These measurements are driver-reported samples, not a guaranteed calibrated USB-meter reading or wall-socket measurement.
 
 ## Current and average current
 
