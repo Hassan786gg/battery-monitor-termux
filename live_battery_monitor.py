@@ -440,6 +440,13 @@ class FrameWriter:
     def __init__(self):
         self._rows = []
         self._dimensions = None
+        self._height = 0
+
+    def finish(self):
+        """Return shell output to a clean row, even after a partial redraw/resize."""
+        terminal = shutil.get_terminal_size((78, 24))
+        row = min(self._height + 1, max(1, terminal.lines))
+        print(f"{RESET}\033[{row};1H\033[J\033[?25h", end="", flush=True)
 
     def write(self, frame, dimensions=None):
         rows = frame.split("\n") if frame else []
@@ -449,6 +456,12 @@ class FrameWriter:
         dimensions = tuple(dimensions)
         old = self._rows
         resized = self._dimensions is not None and dimensions != self._dimensions
+        # Track the footprint before writing: Ctrl+C may interrupt the output.
+        self._height = len(rows) if resized else max(len(old), len(rows))
+        # Dirty updates must not leave the hidden cursor inside a dashboard row:
+        # the terminal can echo ^C there before Python handles the interrupt.
+        prompt_row = min(len(rows) + 1, max(1, dimensions[1]))
+        park = f"\033[{prompt_row};1H"
         if resized:
             # A dirty diff can address rows that no longer exist after a
             # shrink. Clear/repaint from home instead, without old-row cursor
@@ -456,9 +469,10 @@ class FrameWriter:
             repaint = "\033[2J\033[H"
             if rows:
                 repaint += "\033[K\n".join(rows) + "\033[K"
-            print(repaint, end="", flush=True)
+            print(repaint + park, end="", flush=True)
             self._rows = rows
             self._dimensions = dimensions
+            self._height = len(rows)
             return
         changed = []
         for index, line in enumerate(rows):
@@ -468,9 +482,10 @@ class FrameWriter:
         for index in range(len(rows), len(old)):
             changed.append(f"\033[{index + 1};1H\033[K")
         if changed:
-            print("".join(changed), end="", flush=True)
+            print("".join(changed) + park, end="", flush=True)
         self._rows = rows
         self._dimensions = dimensions
+        self._height = len(rows)
 
 
 def display(data, error=None, animation_step=None, writer=None, updated_at=None):
@@ -573,6 +588,7 @@ def main(argv=None):
     history = CurrentHistory()
     animate = not args.no_animation and os.environ.get("BATTERY_MONITOR_NO_ANIMATION") != "1"
     writer = FrameWriter() if TTY else None
+    interrupted = False
     try:
         if TTY:
             print("\033[2J\033[H\033[?25l", end="", flush=True)
@@ -588,7 +604,7 @@ def main(argv=None):
             display(data, error, writer=writer, updated_at=updated_at)
             wait_for_refresh(data, error, animate, writer, updated_at)
     except KeyboardInterrupt:
-        print("\nBattery monitor stopped.", flush=True)
+        interrupted = True
     except BrokenPipeError:
         # Prevent Python's shutdown flush from printing a second pipe error.
         try:
@@ -598,11 +614,13 @@ def main(argv=None):
             pass
         return 0
     finally:
-        if TTY:
+        if writer is not None:
             try:
-                print(RESET + "\033[?25h\n", end="", flush=True)
+                writer.finish()
             except BrokenPipeError:
                 pass
+    if interrupted:
+        print(("" if TTY else "\n") + "Battery monitor stopped.", flush=True)
     return 0
 
 
