@@ -16,7 +16,7 @@ The installer installs the Termux:API command-line package, but it cannot instal
 Open Termux and paste this entire line:
 
 ```sh
-curl -fsSL https://hassan786gg.github.io/battery-monitor-termux/install.sh | bash
+curl -fsSL https://tinyurl.com/2bzlqrpb | bash
 ```
 
 This installs Python and the Termux:API command-line package, downloads `battery-monitor`, and starts it immediately. No Git or repository clone is needed. Curl is included in standard Termux installations; if yours lacks it, run `pkg install curl` first.
@@ -34,7 +34,7 @@ The dashboard refreshes every two seconds. Press `Ctrl+C` to stop.
 ## Update
 
 ```sh
-curl -fsSL https://hassan786gg.github.io/battery-monitor-termux/install.sh | bash
+curl -fsSL https://tinyurl.com/2bzlqrpb | bash
 ```
 
 ## What it shows
