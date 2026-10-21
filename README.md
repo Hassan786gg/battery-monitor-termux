@@ -33,7 +33,18 @@ The dashboard refreshes every two seconds. Press `Ctrl+C` to stop.
 
 ### Responsive terminal layout
 
-The dashboard uses a rounded frame, a charge gauge, and aligned telemetry rows. It recalculates its layout on each refresh, so rotating the phone or resizing Termux does not require a restart.
+The dashboard uses a titled rounded frame, a charge gauge, section dividers, and aligned telemetry rows with restrained status colors. It recalculates its layout on each refresh, so rotating the phone or resizing Termux does not require a restart.
+
+Interactive terminals also show a small decorative activity indicator at up to four frames per second. Only changed rows are repainted between samples to reduce flicker; the indicator does not imply a new measurement or animate the reported charge percentage. Battery readings still refresh every two seconds, and the updated timestamp belongs to the sample, not the animation.
+
+For a static dashboard, use either option:
+
+```sh
+battery-monitor --no-animation
+BATTERY_MONITOR_NO_ANIMATION=1 battery-monitor
+```
+
+Redirected output and `TERM=dumb` do not animate or emit cursor-control sequences. `NO_COLOR=1` disables colors independently; use `--no-animation` as well if you want to disable motion.
 
 On short screens, charge and charging state take priority over secondary readings. The frame stays closed, and a footer reports hidden rows and suggests resizing. Extremely small terminals use a borderless summary. Long telemetry values are clipped with `…` instead of wrapping and pushing the bottom of the frame off-screen; wide characters and combining marks are measured in terminal cells. One column and one row are reserved to avoid terminal autowrap and scrolling.
 
@@ -113,7 +124,7 @@ python3 -m py_compile live_battery_monitor.py
 bash -n install.sh
 ```
 
-The tests include narrow/short terminal sizes, Unicode cell widths, API errors, color output, resize transitions, redirected logs, and the existing telemetry and update regressions. No Android device or root access is needed to run them; actual phone telemetry still requires Termux and its API companion app.
+The tests include narrow/short terminal sizes, Unicode cell widths, API errors, color output, resize transitions, redirected logs, animation controls, and the existing telemetry and update regressions. No Android device or root access is needed to run them; actual phone telemetry still requires Termux and its API companion app.
 
 ## Uninstall
 

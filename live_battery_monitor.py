@@ -33,8 +33,9 @@ TTY = sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
 USE_COLOR = TTY and not os.environ.get("NO_COLOR")
 RESET = "\033[0m"
 COLORS = {
-    "cyan": "\033[96m", "green": "\033[92m", "yellow": "\033[93m",
-    "red": "\033[91m", "dim": "\033[2m", "bold": "\033[1m",
+    # Restrained ANSI palette: readable on light and dark Termux themes.
+    "cyan": "\033[36m", "green": "\033[32m", "yellow": "\033[33m",
+    "red": "\033[31m", "dim": "\033[2m", "bold": "\033[1m",
 }
 CONTROL_CODES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|[\x00-\x1f\x7f-\x9f]")
 
@@ -274,7 +275,7 @@ def fit_text(text, width, pad=False):
     return text + (" " * (width - cell_width(text)) if pad else "")
 
 
-def render_frame(data, error=None, columns=78, rows=None):
+def render_frame(data, error=None, columns=78, rows=None, animation_step=None, updated_at=None):
     """Return a complete frame; rows=None keeps all readings for redirected logs.
 
     Choose rows by importance before drawing, never slice a finished frame.
@@ -304,8 +305,13 @@ def render_frame(data, error=None, columns=78, rows=None):
         value = fit_text(value, max(1, inner - label_width - 1))
         row(fit_text(label, label_width, pad=True) + " " + value, color, priority)
 
-    row(f"BATTERY / LIVE MONITOR  v{VERSION}", "bold", 1 if inner >= 16 else 8)
-    updated = datetime.now().astimezone().strftime("%H:%M:%S %Z")
+    # Animation is deliberately confined to this decorative activity mark;
+    # telemetry values and timestamps remain tied to the last API poll.
+    activity = ""
+    if animation_step is not None and inner >= 24:
+        activity = "  " + "·∘°"[int(animation_step) % 3]
+    row(f"BATTERY / LIVE MONITOR  v{VERSION}{activity}", "bold", 1 if inner >= 16 else 8)
+    updated = (updated_at or datetime.now().astimezone()).strftime("%H:%M:%S %Z")
     row("Developer: Hassan Raza · Updated " + updated, "dim", 8)
     failed = bool(error) or not isinstance(data, dict)
     if failed:
@@ -329,7 +335,7 @@ def render_frame(data, error=None, columns=78, rows=None):
         gauge_size = min(24, max(0, inner - 16))
         filled = round(pct / 100 * gauge_size) if pct is not None else 0
         gauge = "━" * filled + "─" * (gauge_size - filled)
-        charge = f"CHARGE  {percent_text:>4}  {gauge}".rstrip()
+        charge = f"▌ CHARGE  {percent_text:>4}  {gauge}".rstrip()
         if inner < 16:
             charge = percent_text + (" CHARGE" if inner >= 10 else "")
         row(charge, charge_color, 0)
@@ -345,6 +351,9 @@ def render_frame(data, error=None, columns=78, rows=None):
             row("Charging reported; raw current sign is negative.", "yellow", 3)
         metric("BATTERY POWER (EST)", value_or(battery_power_watts(data), lambda x: f"{abs(x):.2f} W"), "cyan", 4)
         row("Battery-side magnitude; not charger input.", "dim", 4)
+        # Section rules are ordinary prioritized rows: they appear with their
+        # reading when there is room, but disappear before data is squeezed.
+        row("──── CURRENT / BATTERY ────", "dim", 4)
         metric("CURRENT (RAW)", value_or(current, lambda x: f"{x / 1000:.0f} mA"), priority=4)
         average = current_number(data.get("current_average"))
         if average is not None:
@@ -355,6 +364,7 @@ def render_frame(data, error=None, columns=78, rows=None):
             metric(f"AVG (APP/RAW, {count})", value_or(average, lambda x: f"{x / 1000:.0f} mA"), priority=5)
         metric("VOLTAGE", value_or(data.get("voltage"), lambda x: f"{x / 1000:.3f} V", True), priority=5)
         io_data = data.get("_power_io") or {}
+        row("──── DEVICE POWER ────", "dim", 5)
         for direction in ("input", "output"):
             reading = io_data.get(direction)
             metric(f"DEVICE {direction.upper()} W", value_or(reading.get("watts"), lambda x: f"{x:.2f} W")
@@ -371,6 +381,7 @@ def render_frame(data, error=None, columns=78, rows=None):
         for reading in io_data.get("ports", [])[:2]:
             if reading.get("limit_watts") is not None:
                 row(f"{reading['supply']} LIMIT: {reading['limit_watts']:.2f} W (not live draw)", "dim", 6)
+        row("──── DEVICE LIMITS ────", "dim", 6)
         metric("DEVICE MAX W", "n/a (not exposed)", priority=6)
         metric("CHARGE COUNTER", value_or(data.get("charge_counter"), lambda x: f"{x / 1000:.0f} mAh", True), priority=6)
         metric("CYCLE COUNT", value_or(data.get("cycle"), lambda x: f"{x:.0f}", True), priority=6)
@@ -380,6 +391,14 @@ def render_frame(data, error=None, columns=78, rows=None):
     footer = f"{'Retry' if failed else 'Live'} {POLL_SECONDS}s · Ctrl+C to quit"
     # Two border lines and one footer are reserved before choosing content.
     capacity = len(entries) if budget is None else max(0, budget - (3 if framed else 1))
+    # Rules are enhancement rows, never a reason to hide telemetry. On a
+    # normal-height phone display, omit the whole set unless all three fit;
+    # taller displays and redirected output get the stronger hierarchy.
+    section_rows = [i for i, (text, _, _) in enumerate(entries)
+                    if text.startswith("──── ")]
+    if budget is not None and section_rows and len(entries) > capacity:
+        entries = [entry for i, entry in enumerate(entries) if i not in section_rows]
+        capacity = len(entries) if budget is None else max(0, budget - (3 if framed else 1))
     hidden = max(0, len(entries) - capacity)
     selected = set(sorted(range(len(entries)), key=lambda i: (entries[i][2], i))[:capacity])
     chosen = [entry for i, entry in enumerate(entries) if i in selected]
@@ -396,7 +415,15 @@ def render_frame(data, error=None, columns=78, rows=None):
         entry = min(entries, key=lambda entry: entry[2])
         return paint(fit_text(entry[0], available), entry[1])
     if framed:
-        lines = [indent + "╭" + "─" * (inner + 2) + "╮"]
+        # The label makes the outer frame an information hierarchy rather than
+        # a purely decorative box. Keep the rule subdued and the title cyan.
+        frame_width = inner + 2
+        title = " POWER / TELEMETRY "
+        title = fit_text(title, max(0, frame_width - 2))
+        remaining = max(0, frame_width - 1 - cell_width(title))
+        top = (indent + "╭─" + paint(title, "cyan") +
+               paint("─" * remaining, "dim") + "╮")
+        lines = [top]
         for text, color, _ in chosen:
             lines.append(indent + "│ " + paint(fit_text(text, inner, pad=True), color) + " │")
         lines.append(indent + "╰" + "─" * (inner + 2) + "╯")
@@ -407,17 +434,80 @@ def render_frame(data, error=None, columns=78, rows=None):
     return "\n".join(lines)
 
 
-def display(data, error=None):
+class FrameWriter:
+    """Write only changed rows for low-flicker TTY animation."""
+
+    def __init__(self):
+        self._rows = []
+        self._dimensions = None
+
+    def write(self, frame, dimensions=None):
+        rows = frame.split("\n") if frame else []
+        if dimensions is None:
+            terminal = shutil.get_terminal_size((78, 24))
+            dimensions = (terminal.columns, terminal.lines)
+        dimensions = tuple(dimensions)
+        old = self._rows
+        resized = self._dimensions is not None and dimensions != self._dimensions
+        if resized:
+            # A dirty diff can address rows that no longer exist after a
+            # shrink. Clear/repaint from home instead, without old-row cursor
+            # addressing; the rendered frame already fits the new dimensions.
+            repaint = "\033[2J\033[H"
+            if rows:
+                repaint += "\033[K\n".join(rows) + "\033[K"
+            print(repaint, end="", flush=True)
+            self._rows = rows
+            self._dimensions = dimensions
+            return
+        changed = []
+        for index, line in enumerate(rows):
+            if index >= len(old) or line != old[index]:
+                changed.append(f"\033[{index + 1};1H{line}\033[K")
+        # Clear rows left behind by a resize or a shorter error frame.
+        for index in range(len(rows), len(old)):
+            changed.append(f"\033[{index + 1};1H\033[K")
+        if changed:
+            print("".join(changed), end="", flush=True)
+        self._rows = rows
+        self._dimensions = dimensions
+
+
+def display(data, error=None, animation_step=None, writer=None, updated_at=None):
     """Recompute layout on every refresh, including after a terminal resize."""
     terminal = shutil.get_terminal_size((78, 24))
-    frame = render_frame(data, error, terminal.columns, terminal.lines if TTY else None)
+    frame = render_frame(data, error, terminal.columns, terminal.lines if TTY else None, animation_step, updated_at)
     if TTY:
-        # Erase each row's old tail as well as old rows below the new frame.
-        # Clearing only at frame end leaves stale right edges after resizing.
-        frame = "\033[K\n".join(frame.split("\n"))
-        print("\033[H" + frame + "\033[K\033[J", end="", flush=True)
+        if writer is None:
+            # Preserve the simple full repaint behavior for direct callers/tests.
+            frame = "\033[K\n".join(frame.split("\n"))
+            print("\033[H" + frame + "\033[K\033[J", end="", flush=True)
+        else:
+            writer.write(frame, (terminal.columns, terminal.lines))
     else:
         print(frame, flush=True)
+
+
+def wait_for_refresh(data, error=None, animate=True, writer=None, updated_at=None):
+    """Wait for the next telemetry poll, animating only on a capable TTY.
+
+    The monotonic deadline keeps polling at two seconds even when a redraw is
+    delayed. ``sleep`` remains injectable for existing main-loop tests.
+    """
+    deadline = time.monotonic() + POLL_SECONDS
+    if not (animate and TTY):
+        time.sleep(max(0, deadline - time.monotonic()))
+        return
+    step = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.25, remaining))
+        if time.monotonic() >= deadline:
+            return
+        step += 1
+        display(data, error, animation_step=step, writer=writer, updated_at=updated_at)
 
 
 def update():
@@ -472,6 +562,7 @@ def update():
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Live Android battery monitor for Termux.")
     parser.add_argument("--version", action="version", version=f"battery-monitor {VERSION}")
+    parser.add_argument("--no-animation", action="store_true", help="Disable the decorative live activity indicator")
     parser.add_argument("command", nargs="?", choices=["update", "diagnose"], help="Update, or print read-only I/O diagnostics")
     args = parser.parse_args(argv)
     if args.command == "update":
@@ -480,6 +571,8 @@ def main(argv=None):
         print(json.dumps(read_power_io(), indent=2, ensure_ascii=True))
         return 0
     history = CurrentHistory()
+    animate = not args.no_animation and os.environ.get("BATTERY_MONITOR_NO_ANIMATION") != "1"
+    writer = FrameWriter() if TTY else None
     try:
         if TTY:
             print("\033[2J\033[H\033[?25l", end="", flush=True)
@@ -491,8 +584,9 @@ def main(argv=None):
                 data = history.with_average(data)
                 if isinstance(data, dict):
                     data["_power_io"] = read_power_io()
-            display(data, error)
-            time.sleep(POLL_SECONDS)
+            updated_at = datetime.now().astimezone()
+            display(data, error, writer=writer, updated_at=updated_at)
+            wait_for_refresh(data, error, animate, writer, updated_at)
     except KeyboardInterrupt:
         print("\nBattery monitor stopped.", flush=True)
     except BrokenPipeError:
