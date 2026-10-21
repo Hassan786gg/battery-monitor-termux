@@ -95,6 +95,7 @@ def display(data, error=None):
     print()
     border(top=True)
     row("BATTERY  /  LIVE MONITOR", "bold")
+    row("Developer: Hassan Raza", "dim")
     border()
     row("Updated  " + datetime.now().astimezone().strftime("%Y-%m-%d  %H:%M:%S %Z"), "dim")
 
