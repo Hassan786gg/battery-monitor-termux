@@ -1,32 +1,41 @@
 #!/usr/bin/env python3
-"""Live Android battery dashboard for Termux + Termux:API.
+"""Live Android battery dashboard for Termux + Termux:API (no root)."""
 
-Reads Android battery telemetry through Termux:API. Android's standard API
-reports a system health flag, not a reliable battery-wear percentage.
-"""
-
+import argparse
+import ast
 import json
+import math
 import os
+from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from datetime import datetime
+from urllib.error import URLError
+from urllib.request import urlopen
 
+VERSION = "1.1.0"
 POLL_SECONDS = 2
 COMMAND = "termux-battery-status"
-TTY = sys.stdout.isatty()
-USE_COLOR = TTY and not os.environ.get("NO_COLOR") and os.environ.get("TERM", "") != "dumb"
+SOURCE_URL = "https://raw.githubusercontent.com/Hassan786gg/battery-monitor-termux/main/live_battery_monitor.py"
+MAX_DOWNLOAD = 1024 * 1024
+TTY = sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
+USE_COLOR = TTY and not os.environ.get("NO_COLOR")
 RESET = "\033[0m"
 COLORS = {
-    "cyan": "\033[96m",
-    "green": "\033[92m",
-    "yellow": "\033[93m",
-    "red": "\033[91m",
-    "dim": "\033[2m",
-    "bold": "\033[1m",
+    "cyan": "\033[96m", "green": "\033[92m", "yellow": "\033[93m",
+    "red": "\033[91m", "dim": "\033[2m", "bold": "\033[1m",
 }
+CONTROL_CODES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|[\x00-\x1f\x7f-\x9f]")
+
+
+def clean_text(value):
+    """Do not let API error messages inject terminal controls."""
+    return CONTROL_CODES.sub(" ", str(value))
 
 
 def paint(text, color=None):
@@ -35,129 +44,217 @@ def paint(text, color=None):
     return str(text)
 
 
+def finite_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def read_battery_status():
-    """Return (battery_data, error_message)."""
+    """Return (battery_data, error_message), including recoverable API errors."""
     if shutil.which(COMMAND) is None:
         return None, (
-            "Missing termux-battery-status. In Termux run: pkg install termux-api. "
-            "Install the Termux:API app from the same source as Termux."
+            "Missing termux-battery-status. Run: pkg install termux-api. "
+            "Also install the Termux:API Android app from the same source as Termux."
         )
-
     try:
         result = subprocess.run(
-            [COMMAND], capture_output=True, text=True, timeout=10, check=False
+            [COMMAND], capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=10, check=False,
         )
     except subprocess.TimeoutExpired:
-        return None, "Battery API timed out. Check that Termux:API is installed and open."
+        return None, "Battery API timed out. Check that the Termux:API Android app is installed."
     except OSError as exc:
         return None, f"Could not start the battery API: {exc}"
-
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "No details returned."
         return None, f"Battery API error: {detail}"
-
     try:
         data = json.loads(result.stdout)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         return None, "The battery API returned unreadable data."
-
-    if not isinstance(data, dict):
-        return None, "Unexpected battery API response."
+    if not isinstance(data, dict) or not data:
+        return None, "The battery API returned no battery information."
+    if data.get("error"):
+        return None, f"Battery API error: {data['error']}"
     return data, None
 
 
-def value_or(value, formatter=str):
-    if value is None:
+def value_or(value, formatter=str, nonnegative=False):
+    number = finite_number(value)
+    if number is None or (nonnegative and number < 0):
         return "n/a"
     try:
-        return formatter(value)
+        return formatter(number)
     except (TypeError, ValueError, OverflowError):
-        return str(value)
+        return "n/a"
 
 
 def display(data, error=None):
-    if TTY:
-        print("\033[2J\033[H", end="")
-
-    columns = shutil.get_terminal_size((78, 24)).columns
-    total_width = max(40, min(74, columns - 4))
-    inner = total_width - 6
+    """Build one frame, then repaint once to reduce flicker and stale rows."""
+    terminal = shutil.get_terminal_size((78, 24))
+    columns = max(8, terminal.columns)
+    indent = "  " if columns >= 20 else ""
+    # Leave one column spare so terminal autowrap does not add blank lines.
+    width = min(72, columns - len(indent) - 1)
+    inner = max(1, width - 4)
+    lines = []
 
     def border(top=False, bottom=False):
         left, right = ("┌", "┐") if top else (("└", "┘") if bottom else ("├", "┤"))
-        print("  " + left + "─" * (inner + 2) + right)
+        lines.append(indent + left + "─" * (inner + 2) + right)
 
     def row(text="", color=None):
-        parts = textwrap.wrap(str(text), width=inner) or [""]
+        parts = textwrap.wrap(clean_text(text), width=inner) or [""]
         for part in parts:
-            print("  │ " + paint(part.ljust(inner), color) + " │")
+            lines.append(indent + "│ " + paint(part.ljust(inner), color) + " │")
 
-    print()
+    def footer(text):
+        for part in textwrap.wrap(clean_text(text), width=max(1, columns - len(indent) - 1)):
+            lines.append(indent + paint(part, "dim"))
+
     border(top=True)
-    row("BATTERY  /  LIVE MONITOR", "bold")
+    row("BATTERY / LIVE MONITOR", "bold")
     row("Developer: Hassan Raza", "dim")
     border()
-    row("Updated  " + datetime.now().astimezone().strftime("%Y-%m-%d  %H:%M:%S %Z"), "dim")
+    row("Updated " + datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"), "dim")
 
-    if error:
+    if error or not isinstance(data, dict):
         row()
         row("Could not read battery data", "yellow")
-        row(error)
+        row(error or "Unexpected battery API response.")
         border(bottom=True)
-        print(paint(f"  Retrying in {POLL_SECONDS}s  ·  Ctrl+C to quit", "dim"))
-        return
-
-    percentage = data.get("percentage")
-    if percentage is None:
-        level, scale = data.get("level"), data.get("scale")
-        if isinstance(level, (int, float)) and isinstance(scale, (int, float)) and scale:
-            percentage = round(level * 100 / scale)
-
-    try:
-        pct = max(0, min(100, float(percentage))) if percentage is not None else None
-    except (TypeError, ValueError):
-        pct = None
-
-    if pct is None:
-        percent_text, gauge, charge_color = "n/a", "░" * 12, "dim"
+        footer(f"Retrying in {POLL_SECONDS}s · Ctrl+C to quit")
     else:
-        filled = round(pct / 100 * 12)
-        gauge = "█" * filled + "░" * (12 - filled)
-        percent_text = f"{pct:.0f}%"
-        charge_color = "green" if pct >= 60 else ("yellow" if pct >= 25 else "red")
+        pct = finite_number(data.get("percentage"))
+        if pct is None:
+            level, scale = finite_number(data.get("level")), finite_number(data.get("scale"))
+            if level is not None and scale is not None and scale > 0:
+                pct = finite_number(level / scale * 100)
+        if pct is None or pct < 0:
+            percent_text, gauge, charge_color = "n/a", "░" * 12, "dim"
+        else:
+            pct = min(100, pct)
+            filled = round(pct / 100 * 12)
+            gauge = "█" * filled + "░" * (12 - filled)
+            percent_text = f"{pct:.0f}%"
+            charge_color = "green" if pct >= 60 else ("yellow" if pct >= 25 else "red")
+        status = clean_text(data.get("status") or "n/a").replace("_", " ")
+        plugged = clean_text(data.get("plugged") or "n/a").replace("_", " ")
+        health = clean_text(data.get("health") or "n/a").replace("_", " ")
+        health_color = "green" if health == "GOOD" else ("yellow" if health == "n/a" else "red")
+        row()
+        row(f"CHARGE   {percent_text:>4}   {gauge}", charge_color)
+        row(f"STATE    {status} · {plugged}", "cyan")
+        border()
+        row(f"SYSTEM HEALTH FLAG   {health}", health_color)
+        row("TEMPERATURE          " + value_or(data.get("temperature"), lambda x: f"{x:.1f} °C"))
+        row("VOLTAGE              " + value_or(data.get("voltage"), lambda x: f"{x / 1000:.3f} V", True))
+        row("CURRENT              " + value_or(data.get("current"), lambda x: f"{x / 1000:.0f} mA"))
+        row("AVERAGE CURRENT      " + value_or(data.get("current_average"), lambda x: f"{x / 1000:.0f} mA"))
+        row("CHARGE COUNTER       " + value_or(data.get("charge_counter"), lambda x: f"{x / 1000:.0f} mAh", True))
+        row("CYCLE COUNT          " + value_or(data.get("cycle"), lambda x: f"{x:.0f}", True))
+        border(bottom=True)
+        footer("Live telemetry only · Android does not expose a standard battery-wear %")
+        footer(f"Refreshes every {POLL_SECONDS}s · Ctrl+C to quit")
+    if TTY and len(lines) > max(1, terminal.lines - 1):
+        # Do not scroll the whole screen on every refresh in a short window.
+        budget = max(1, terminal.lines - 1)
+        notice = "Resize for more readings · Ctrl+C to quit"
+        lines = lines[:max(0, budget - 1)]
+        lines.append(indent + notice[:max(1, columns - len(indent) - 1)])
+    frame = "\n".join(lines)
+    if TTY:
+        print("\033[H" + frame + "\033[J", end="", flush=True)
+    else:
+        print(frame, flush=True)
 
-    status = str(data.get("status") or "n/a").replace("_", " ")
-    plugged = str(data.get("plugged") or "n/a").replace("_", " ")
-    health = str(data.get("health") or "n/a").replace("_", " ")
-    health_color = "green" if health == "GOOD" else ("yellow" if health == "n/a" else "red")
 
-    row()
-    row(f"CHARGE   {percent_text:>4}   {gauge}", charge_color)
-    row(f"STATE    {status}   ·   {plugged}", "cyan")
-    border()
-    row(f"SYSTEM HEALTH FLAG   {health}", health_color)
-    row("TEMPERATURE          " + value_or(data.get("temperature"), lambda x: f"{float(x):.1f} °C"))
-    row("VOLTAGE              " + value_or(data.get("voltage"), lambda x: f"{float(x) / 1000:.3f} V"))
-    row("CURRENT              " + value_or(data.get("current"), lambda x: f"{float(x) / 1000:.0f} mA"))
-    row("AVERAGE CURRENT      " + value_or(data.get("current_average"), lambda x: f"{float(x) / 1000:.0f} mA"))
-    row("CHARGE COUNTER       " + value_or(data.get("charge_counter"), lambda x: f"{float(x) / 1000:.0f} mAh"))
-    row("CYCLE COUNT          " + value_or(data.get("cycle")))
-    border(bottom=True)
-    print(paint("  Live telemetry only · Android doesn't expose a standard battery-wear %", "dim"))
-    print(paint(f"  Refreshes every {POLL_SECONDS}s  ·  Ctrl+C to quit", "dim"))
-
-
-def main():
+def update():
+    """Download, validate, and atomically replace the installed command."""
+    prefix = os.environ.get("PREFIX")
+    if not prefix or shutil.which("pkg") is None:
+        print("Run battery-monitor update inside Termux.", file=sys.stderr)
+        return 1
+    destination = Path(prefix) / "bin" / "battery-monitor"
+    temporary = None
     try:
+        print("Checking for the latest battery-monitor…", flush=True)
+        with urlopen(SOURCE_URL, timeout=25) as response:
+            payload = response.read(MAX_DOWNLOAD + 1)
+        if not payload or len(payload) > MAX_DOWNLOAD:
+            raise ValueError("Empty or oversized update download")
+        source = payload.decode("utf-8")
+        tree = ast.parse(source)
+        functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+        if not {"main", "display", "update"}.issubset(functions):
+            raise ValueError("The download is not a compatible battery-monitor release")
+        # Use the actual Termux interpreter, not /usr/bin/env on Android.
+        source = f"#!{Path(prefix) / 'bin' / 'python'}\n" + source.split("\n", 1)[1]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=destination.parent,
+            prefix=".battery-monitor.", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(source)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), 0o755)
+        os.replace(temporary, destination)
+        temporary = None
+    except KeyboardInterrupt:
+        print("\nUpdate cancelled.", file=sys.stderr)
+        return 130
+    except (OSError, URLError, UnicodeError, SyntaxError, ValueError) as exc:
+        print(f"Update failed: {clean_text(exc)}. Existing installation was not replaced.", file=sys.stderr)
+        return 1
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    print("Update complete. Run battery-monitor to open the dashboard.")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Live Android battery monitor for Termux.")
+    parser.add_argument("--version", action="version", version=f"battery-monitor {VERSION}")
+    parser.add_argument("command", nargs="?", choices=["update"], help="Install the latest version and exit")
+    args = parser.parse_args(argv)
+    if args.command == "update":
+        return update()
+    try:
+        if TTY:
+            print("\033[2J\033[H\033[?25l", end="", flush=True)
         while True:
             data, error = read_battery_status()
             display(data, error)
             time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:
+        print("\nBattery monitor stopped.", flush=True)
+    except BrokenPipeError:
+        # Prevent Python's shutdown flush from printing a second pipe error.
+        try:
+            with open(os.devnull, "w") as sink:
+                os.dup2(sink.fileno(), sys.stdout.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+        return 0
+    finally:
         if TTY:
-            print("\033[2J\033[H", end="")
-        print("Battery monitor stopped.")
+            try:
+                print(RESET + "\033[?25h\n", end="", flush=True)
+            except BrokenPipeError:
+                pass
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
